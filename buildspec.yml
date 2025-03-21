@@ -1,0 +1,22 @@
+version: 0.2
+
+phases:
+  install:
+    runtime-versions:
+      nodejs: 18
+    commands:
+      - echo Installing Node.js dependencies...
+      - npm install
+  build:
+    commands:
+      - echo Building the application...
+      - npm run build
+
+artifacts:
+  files:
+    - '**/*'
+  discard-paths: no
+
+cache:
+  paths:
+    - 'node_modules/**/*'
