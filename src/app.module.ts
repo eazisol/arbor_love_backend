@@ -6,7 +6,7 @@ import { QuoteModule } from './quote/quote.module';
 import { ImageUploadModule } from './s3Service/s3Service.module';
 import { AppController } from './app.controller';
 import { AppService } from './app.service';
-import { TestDynamoController } from './test/test-dynamo.controller'; // ✅
+import { MongooseModule } from '@nestjs/mongoose';
 
 
 @Module({
@@ -15,10 +15,13 @@ import { TestDynamoController } from './test/test-dynamo.controller'; // ✅
       isGlobal: true,
       envFilePath: '.env',
     }),
+    MongooseModule.forRoot(process.env.MONGO_URI, {
+      dbName: 'arbor_love',
+    }),
     QuoteModule,
     ImageUploadModule,
   ],
-  controllers: [AppController, TestDynamoController],
+  controllers: [AppController],
   providers: [AppService],
 })
 export class AppModule {}

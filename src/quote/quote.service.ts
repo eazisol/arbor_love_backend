@@ -1,196 +1,119 @@
 import { Injectable } from '@nestjs/common';
 import { v4 as uuidv4 } from 'uuid';
-import * as fs from 'fs';
-import * as path from 'path';
-import * as Handlebars from 'handlebars';
+import { InjectModel } from '@nestjs/mongoose';
+import { Model } from 'mongoose';
 import { CreateQuoteDto } from './dto/create-quote.dto';
-import { DynamoDbService } from 'src/dynamodb/dynamodb.service';
+import { Quote } from './schemas/quote.schema'; // your schema file
 import { ConfigService } from '@nestjs/config';
-import { emailTemplate } from './templates/email_template';
-import {quoteNotificationTemplate} from './templates/email_info_template'
-
-import {
-  DynamoDBClient,
-  PutItemCommand,
-  ScanCommandInput,
-  ScanCommand,
-  GetItemCommand,
-  DeleteItemCommand,
-} from '@aws-sdk/client-dynamodb';
 import { SendEmailCommand, SESClient } from '@aws-sdk/client-ses';
+import { emailTemplate } from './templates/email_template';
+import { quoteNotificationTemplate } from './templates/email_info_template';
+import * as Handlebars from 'handlebars';
+import path from 'path';
+import * as fs from 'fs';
+import { QuoteOption } from './schemas/quote-options.schema';
+import { QuoteProduction } from './schemas/quotes-production.schema';
+import { ScoringFactor } from './schemas/scoring-factor.schema';
+
 
 @Injectable()
 export class QuoteService {
-  private client: DynamoDBClient;
   private sesClient: SESClient;
 
   constructor(
-    private readonly dynamoDbService: DynamoDbService,
-    private configService: ConfigService,
-    
+    @InjectModel(Quote.name) private readonly quoteModel: Model<Quote>,
+    @InjectModel(QuoteOption.name) private optionModel: Model<QuoteOption>,
+    @InjectModel(QuoteProduction.name) private productionModel: Model<QuoteProduction>,
+    @InjectModel(ScoringFactor.name) private factorModel: Model<ScoringFactor>,
+    private readonly configService: ConfigService,
   ) {
-    console.log('DynamoDBClient config:', {
-      region: this.configService.get<string>('AWS_REGION'),
-      endpoint: this.configService.get<string>('DYNAMODB_ENDPOINT'),
-      accessKeyId: this.configService.get<string>('AWS_ACCESS_KEY_ID'),
-      secretAccessKey: this.configService.get<string>('AWS_SECRET_ACCESS_KEY'),
-    });
-    
-    this.client = new DynamoDBClient({
-      
-      region: this.configService.get<string>('AWS_REGION'),
-      endpoint: this.configService.get<string>('DYNAMODB_ENDPOINT'), // ✅ fix here
-      credentials: {
-        accessKeyId: this.configService.get<string>('AWS_ACCESS_KEY_ID'),
-        secretAccessKey: this.configService.get<string>(
-          'AWS_SECRET_ACCESS_KEY',
-        ),
-      },
-    });
     this.sesClient = new SESClient({
       region: this.configService.get<string>('AWS_REGION'),
       credentials: {
         accessKeyId: this.configService.get<string>('AWS_ACCESS_KEY_ID'),
-        secretAccessKey: this.configService.get<string>(
-          'AWS_SECRET_ACCESS_KEY',
-        ),
+        secretAccessKey: this.configService.get<string>('AWS_SECRET_ACCESS_KEY'),
       },
     });
   }
 
+  
   async getOptions(): Promise<Record<string, string[]>> {
-    const params: ScanCommandInput = {
-      TableName: 'QuoteOptions',
-    };
-    const command = new ScanCommand(params);
-    const response = await this.client.send(command);
-
-    const options: Record<string, string[]> = {};
-
-    for (const item of response.Items) {
-      const optionType = item.optionType.S;
-      const value = item.value.S;
-
-      if (!options[optionType]) {
-        options[optionType] = [];
+    const allOptions = await this.optionModel.find().lean();
+  
+    const grouped: Record<string, Set<string>> = {};
+  
+    for (const { optionType, value } of allOptions) {
+      if (!grouped[optionType]) {
+        grouped[optionType] = new Set();
       }
-      options[optionType].push(value);
+      grouped[optionType].add(value);
     }
+  
+    // Convert sets to arrays for the final response
+    const response: Record<string, string[]> = {};
+    for (const key in grouped) {
+      response[key] = Array.from(grouped[key]);
+    }
+  
+    // Optional: remap 'serviceType' to 'JOB_TYPES' if needed
+    if (response['serviceType']) {
+      response['JOB_TYPES'] = response['serviceType'];
+      delete response['serviceType'];
+    }
+  
+    return response;
+  }
+  
 
-    return options;
+
+
+
+  async getQuote(quoteId: string): Promise<Quote> {
+    return this.quoteModel.findOne({ quoteId }).lean();
   }
 
-  async getQuote(quoteId: string): Promise<any> {
-    const params = {
-      TableName: process.env.AWS_DYNAMODB_TABLE_NAME,
-      Key: {
-        quoteId: { S: quoteId },
-      },
-    };
-
-    try {
-      const data = await this.client.send(new GetItemCommand(params));
-      return this.transformDynamoDBItem(data.Item);
-    } catch (err) {
-      throw new Error(`Error fetching quote: ${err.message}`);
-    }
+  async getAllQuotes(): Promise<Quote[]> {
+    return this.quoteModel.find().lean();
   }
 
-  async getAllQuotes(): Promise<any> {
-    const params: ScanCommandInput = {
-      TableName: process.env.AWS_DYNAMODB_TABLE_NAME,
-    };
-
-    try {
-      const data = await this.client.send(new ScanCommand(params));
-      if (!data.Items) {
-        throw new Error('No quotes found.');
-      }
-      const quotes = data.Items.map((item) => this.transformDynamoDBItem(item));
-      return quotes;
-    } catch (err) {
-      throw new Error(`Error fetching all quotes: ${err.message}`);
-    }
+  async deleteAllQuotes(): Promise<{ message: string }> {
+    await this.quoteModel.deleteMany({});
+    return { message: 'All quotes deleted successfully.' };
   }
 
-  // To transform DynamoDB data
-  private transformDynamoDBItem(item: any): any {
-    if (!item) {
-      return null;
+  async createQuote(createQuoteDto: CreateQuoteDto): Promise<any> {
+    const { clientDetails, services } = createQuoteDto;
+    let totalAmount = 0;
+
+    for (const service of services) {
+      const amount = await this.generateNewQuote(service);
+      totalAmount += amount;
     }
 
-    const getNestedValue = (obj, path, defaultValue = null) => {
-      return path.reduce(
-        (acc, part) => (acc && acc[part] ? acc[part] : defaultValue),
-        obj,
-      );
-    };
+    const quoteId = uuidv4();
+    const dateCreated = new Date().toISOString();
 
-    const transformService = (service) => ({
-      serviceType: getNestedValue(service, ['M', 'serviceType', 'S'], ''),
-      numOfTrees: parseInt(
-        getNestedValue(service, ['M', 'numOfTrees', 'N'], '0'),
-        10,
-      ),
-      treeLocation: getNestedValue(service, ['M', 'treeLocation', 'S'], ''),
-      treeType: getNestedValue(service, ['M', 'treeType', 'S'], ''),
-      treeHeight: getNestedValue(service, ['M', 'treeHeight', 'S'], ''),
-      utilityLines: getNestedValue(
-        service,
-        ['M', 'utilityLines', 'BOOL'],
-        false,
-      ),
-      stumpRemoval: getNestedValue(
-        service,
-        ['M', 'stumpRemoval', 'BOOL'],
-        false,
-      ),
-      propertyFenced: getNestedValue(
-        service,
-        ['M', 'propertyFenced', 'BOOL'],
-        false,
-      ),
-      equipmentAccess: getNestedValue(
-        service,
-        ['M', 'equipmentAccess', 'BOOL'],
-        false,
-      ),
-      emergencyCutting: getNestedValue(
-        service,
-        ['M', 'emergencyCutting', 'BOOL'],
-        false,
-      ),
-      fallenDown: getNestedValue(service, ['M', 'fallenDown', 'BOOL'], false),
-      imageUrls: getNestedValue(service, ['M', 'imageUrls', 'SS'], []),
+    const newQuote = await this.quoteModel.create({
+      quoteId,
+      clientDetails,
+      services,
+      amount: totalAmount,
+      dateCreated,
     });
+
+    await this.sendQuoteNotification(
+      quoteId,
+      clientDetails,
+      services,
+      totalAmount,
+      dateCreated,
+      clientDetails.additionalInfo,
+    );
 
     return {
-      quoteId: getNestedValue(item, ['quoteId', 'S'], ''),
-      clientDetails: {
-        name: getNestedValue(item, ['clientDetails', 'M', 'name', 'S'], ''),
-        address: getNestedValue(
-          item,
-          ['clientDetails', 'M', 'address', 'S'],
-          '',
-        ),
-        phone: getNestedValue(item, ['clientDetails', 'M', 'phone', 'S'], ''),
-        email: getNestedValue(item, ['clientDetails', 'M', 'email', 'S'], ''),
-        propertyOwner: getNestedValue(
-          item,
-          ['clientDetails', 'M', 'propertyOwner', 'BOOL'],
-          false,
-        ),
-        additionalInfo: getNestedValue(
-          item,
-          ['clientDetails', 'M', 'additionalInfo', 'S'],
-          '',
-        ), // Retrieve additionalInfo
-      },
-      services: getNestedValue(item, ['services', 'L'], []).map(
-        transformService,
-      ),
-      amount: parseFloat(getNestedValue(item, ['amount', 'N'], '0')),
-      dateCreated: getNestedValue(item, ['dateCreated', 'S'], ''),
+      message: 'Quote inserted successfully',
+      quoteId,
+      amount: totalAmount,
     };
   }
 
@@ -278,35 +201,6 @@ export class QuoteService {
     }    
   }
 
-  async deleteAllQuotes(): Promise<any> {
-    const scanParams: ScanCommandInput = {
-      TableName: process.env.AWS_DYNAMODB_TABLE_NAME,
-    };
-
-    try {
-      const data = await this.client.send(new ScanCommand(scanParams));
-
-      if (!data.Items) {
-        return { message: 'No quotes to delete.' };
-      }
-
-      const deletePromises = data.Items.map(async (item) => {
-        const deleteParams = {
-          TableName: process.env.AWS_DYNAMODB_TABLE_NAME,
-          Key: {
-            quoteId: { S: item.quoteId.S },
-          },
-        };
-        await this.client.send(new DeleteItemCommand(deleteParams));
-      });
-
-      await Promise.all(deletePromises);
-
-      return { message: 'All quotes deleted successfully.' };
-    } catch (err) {
-      throw new Error(`Error deleting all quotes: ${err.message}`);
-    }
-  }
 
   private async generateNewQuote({
     treeType,
@@ -628,93 +522,6 @@ export class QuoteService {
     return this.applyPricingTiers(amount);
   }
 
-  async createQuote(createQuoteDto: CreateQuoteDto): Promise<any> {
-    const { clientDetails, services } = createQuoteDto;
-    let totalAmount = 0;
-
-    for (const service of services) {
-      const amount = await this.generateNewQuote({
-        ...service,
-      });
-      totalAmount += amount;
-    }
-    const quoteId = uuidv4();
-
-    const params = {
-      TableName: process.env.AWS_DYNAMODB_TABLE_NAME,
-      Item: {
-        quoteId: { S: quoteId },
-        clientDetails: {
-          M: {
-            name: { S: clientDetails.name },
-            address: { S: clientDetails.address },
-            phone: { S: clientDetails.phone },
-            email: { S: clientDetails.email },
-            propertyOwner: { BOOL: clientDetails.propertyOwner },
-            additionalInfo: { S: clientDetails.additionalInfo || '' },
-          },
-        },
-        services: {
-          L: services.map((service) => {
-            const serviceItem = {
-              M: {
-                serviceType: { S: service.serviceType },
-                treeLocation: { S: service.treeLocation },
-                treeType: { S: service.treeType },
-                treeHeight: { S: service.treeHeight },
-                utilityLines: { BOOL: service.utilityLines },
-                propertyFenced: { BOOL: service.propertyFenced },
-                equipmentAccess: { BOOL: service.equipmentAccess },
-                emergencyCutting: { BOOL: service.emergencyCutting },
-              },
-            };
-
-            // Add optional fields if they exist
-            if (service.numOfTrees !== undefined) {
-              serviceItem.M['numOfTrees'] = {
-                N: service.numOfTrees.toString(),
-              };
-            }
-            if (service.stumpRemoval) {
-              serviceItem.M['stumpRemoval'] = { BOOL: service.stumpRemoval };
-            }
-            if (service.fallenDown) {
-              serviceItem.M['fallenDown'] = { BOOL: service.fallenDown };
-            }
-            if (service.imageUrls) {
-              serviceItem.M['imageUrls'] = { SS: service.imageUrls };
-            }
-
-            return serviceItem;
-          }),
-        },
-        amount: { N: totalAmount.toString() },
-        dateCreated: { S: new Date().toISOString() },
-      },
-    };
-
-    try {
-      // Insert the quote into DynamoDB
-      await this.client.send(new PutItemCommand(params));
-      const dateCreated = new Date().toISOString();
-      // Send an email notification to the client
-      await this.sendQuoteNotification(
-        quoteId,
-        clientDetails,
-        services,
-        totalAmount,
-        dateCreated,
-        clientDetails.additionalInfo,
-      );
-      return {
-        message: 'Quote inserted successfully',
-        quoteId,
-        amount: totalAmount,
-      };
-    } catch (err) {
-      throw new Error(`Error inserting quote: ${err.message}`);
-    }
-  }
 
   private applyPricingTiers(amount: number): number {
     if (amount < 2500) {
