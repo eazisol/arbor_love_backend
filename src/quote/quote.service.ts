@@ -5,20 +5,21 @@ import { Model } from 'mongoose';
 import { CreateQuoteDto } from './dto/create-quote.dto';
 import { Quote } from './schemas/quote.schema'; // your schema file
 import { ConfigService } from '@nestjs/config';
-import { SendEmailCommand, SESClient } from '@aws-sdk/client-ses';
 import { emailTemplate } from './templates/email_template';
 import { quoteNotificationTemplate } from './templates/email_info_template';
 import * as Handlebars from 'handlebars';
 import path from 'path';
 import * as fs from 'fs';
+import * as nodemailer from 'nodemailer';
 import { QuoteOption } from './schemas/quote-options.schema';
 import { QuoteProduction } from './schemas/quotes-production.schema';
 import { ScoringFactor } from './schemas/scoring-factor.schema';
+import { SentMessageInfo, Options } from 'nodemailer/lib/smtp-transport';
 
 
 @Injectable()
 export class QuoteService {
-  private sesClient: SESClient;
+  private transporter: nodemailer.Transporter<SentMessageInfo, Options>;
 
   constructor(
     @InjectModel(Quote.name) private readonly quoteModel: Model<Quote>,
@@ -27,11 +28,13 @@ export class QuoteService {
     @InjectModel(ScoringFactor.name) private factorModel: Model<ScoringFactor>,
     private readonly configService: ConfigService,
   ) {
-    this.sesClient = new SESClient({
-      region: this.configService.get<string>('AWS_REGION'),
-      credentials: {
-        accessKeyId: this.configService.get<string>('AWS_ACCESS_KEY_ID'),
-        secretAccessKey: this.configService.get<string>('AWS_SECRET_ACCESS_KEY'),
+    this.transporter = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 587, // TLS
+      secure: false,
+      auth: {
+        user: this.configService.get<string>('GMAIL_EMAIL'),
+        pass: this.configService.get<string>('GMAIL_APP_PASSWORD'),
       },
     });
   }
@@ -129,14 +132,14 @@ export class QuoteService {
     services: any[],
     amount: number,
     dateCreated: string,
-    additionalInfo:string,
+    additionalInfo: string,
   ): Promise<void> {
     const template = Handlebars.compile(emailTemplate);
-
+  
     const data = {
       clientName: clientDetails.name,
-      quoteId: quoteId,
-      dateCreated: dateCreated,
+      quoteId,
+      dateCreated,
       services: services.map((service) => ({
         serviceType: service.serviceType,
         treeLocation: service.treeLocation,
@@ -145,61 +148,43 @@ export class QuoteService {
         numOfTrees: service.numOfTrees,
         utilityLines: service.utilityLines ? 'Yes' : 'No',
         stumpRemoval: service.stumpRemoval ? 'Yes' : 'No',
-        imageUrl:service.imageUrls
+        imageUrl: service.imageUrls,
+       
       })),
-      amount:amount.toFixed(2),
+      amount: amount.toFixed(2),
       additionalInfo,
     };
-
     const htmlBody = template(data);
     const adminTemplate = Handlebars.compile(quoteNotificationTemplate);
     const adminHtmlBody = adminTemplate(data);
-
-    const params = {
-      Destination: {
-        ToAddresses: [clientDetails.email],
-      },
-      Message: {
-        Body: {
-          Html: {
-            Data: htmlBody,
-          },
-        },
-        Subject: {
-          Data: 'Your Tree Service Quote',
-        },
-      },
-      Source: this.configService.get<string>('SES_SOURCE_EMAIL'),
+  
+    const clientMailOptions = {
+      from: this.configService.get<string>('GMAIL_EMAIL'),
+      to: clientDetails.email,
+      subject: 'Your Tree Service Quote',
+      html: htmlBody,
     };
-
-    const adminParams = {
-      Destination: {
-        ToAddresses: ['info@arborlove.com'],
-      },
-      Message: {
-        Body: {
-          Html: {
-            Data: adminHtmlBody, // Send the admin template to the admin
-          },
-        },
-        Subject: {
-          Data: 'New Quote Requested',
-        },
-      },
-      Source: this.configService.get<string>('SES_SOURCE_EMAIL'),
+  
+    const adminMailOptions = {
+      from: this.configService.get<string>('GMAIL_EMAIL'),
+      to: 'info@arborlove.com',
+      subject: 'New Quote Requested',
+      html: adminHtmlBody,
     };
-
+  
     try {
       if (process.env.SHOULD_SEND_EMAIL === 'true') {
-        await this.sesClient.send(new SendEmailCommand(params));
-        await this.sesClient.send(new SendEmailCommand(adminParams));
+        console.log('📧 Sending email...');
+        await this.transporter.sendMail(clientMailOptions);
+        await this.transporter.sendMail(adminMailOptions);
       } else {
-        console.log('📭 Skipping SES email send in development mode');
+        console.log('📭 Skipping email send in development mode');
       }
     } catch (err) {
-      throw new Error(`Error sending SES email: ${err.message}`);
-    }    
+      throw new Error(`Error sending email: ${err.message}`);
+    }
   }
+  
 
 
   private async generateNewQuote({
